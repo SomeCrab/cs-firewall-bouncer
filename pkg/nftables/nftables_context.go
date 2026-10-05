@@ -392,6 +392,11 @@ func (c *nftContext) deleteElements(els []nftables.SetElement) error {
 }
 
 func (c *nftContext) addElements(els map[string][]nftables.SetElement) error {
+	type elementState struct {
+		timed   bool
+		expires time.Duration
+	}
+
 	var setName string
 
 	for origin, set := range c.sets {
@@ -405,18 +410,25 @@ func (c *nftContext) addElements(els map[string][]nftables.SetElement) error {
 			return fmt.Errorf("failed to get ip%s elements from set: %w", c.version, err)
 		}
 
-		remaining := make(map[string]time.Duration, len(current))
+		existing := make(map[string]elementState, len(current))
 		for i := range current {
-			remaining[string(current[i].Key)] = current[i].Expires
+			existing[string(current[i].Key)] = elementState{
+				// Inherited set timeouts are also reported on each element.
+				timed:   current[i].Timeout > 0,
+				expires: current[i].Expires,
+			}
 		}
 
-		// A shorter overlapping addition must not reduce a live timeout.
+		// Preserve permanent elements and longer remaining timeouts.
 		// Explicit removals are handled before additions by Commit.
-		refresh := make([]nftables.SetElement, 0, len(pending))
+		toAdd := make([]nftables.SetElement, 0, len(pending))
 		for i := range pending {
-			if pending[i].Timeout > remaining[string(pending[i].Key)] {
-				refresh = append(refresh, pending[i])
+			state, present := existing[string(pending[i].Key)]
+			if present && (!state.timed || pending[i].Timeout <= state.expires) {
+				continue
 			}
+
+			toAdd = append(toAdd, pending[i])
 		}
 
 		if c.setOnly {
@@ -425,25 +437,33 @@ func (c *nftContext) addElements(els map[string][]nftables.SetElement) error {
 			setName = fmt.Sprintf("%s-%s", c.blacklists, origin)
 		}
 
-		log.Debugf("Using %s as origin | len of IPs: %d | set name is %s", origin, len(refresh), setName)
+		log.Debugf("Using %s as origin | len of IPs: %d | set name is %s", origin, len(toAdd), setName)
 
-		for _, chunk := range slicetools.Chunks(refresh, chunkSize) {
+		for _, chunk := range slicetools.Chunks(toAdd, chunkSize) {
 			log.Debugf("adding %d ip%s elements to set %s", len(chunk), c.version, setName)
 
 			if err := c.conn.SetAddElements(set, chunk); err != nil {
 				return fmt.Errorf("failed to add ip%s elements to set: %w", c.version, err)
 			}
 
-			// An add alone does not refresh an existing element's timeout.
-			// Ensure every key exists, then replace the chunk in one atomic
-			// transaction so neither absent keys nor expiry races break deletion,
-			// and packets never observe the intermediate removal.
-			if err := c.conn.SetDeleteElements(set, chunk); err != nil {
-				return fmt.Errorf("failed to replace ip%s elements in set: %w", c.version, err)
+			var refresh []nftables.SetElement
+			for i := range chunk {
+				if _, present := existing[string(chunk[i].Key)]; present {
+					refresh = append(refresh, chunk[i])
+				}
 			}
 
-			if err := c.conn.SetAddElements(set, chunk); err != nil {
-				return fmt.Errorf("failed to add ip%s elements to set: %w", c.version, err)
+			if len(refresh) > 0 {
+				// The first add ensures refresh keys exist even if they expired
+				// since the snapshot. Replace only existing timed elements in
+				// this same transaction, so packets never observe a removal.
+				if err := c.conn.SetDeleteElements(set, refresh); err != nil {
+					return fmt.Errorf("failed to replace ip%s elements in set: %w", c.version, err)
+				}
+
+				if err := c.conn.SetAddElements(set, refresh); err != nil {
+					return fmt.Errorf("failed to add ip%s elements to set: %w", c.version, err)
+				}
 			}
 
 			if err := c.conn.Flush(); err != nil {
