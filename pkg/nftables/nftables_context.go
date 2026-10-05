@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/binaryutil"
@@ -394,16 +395,52 @@ func (c *nftContext) addElements(els map[string][]nftables.SetElement) error {
 	var setName string
 
 	for origin, set := range c.sets {
+		pending := els[origin]
+		if len(pending) == 0 {
+			continue
+		}
+
+		current, err := c.conn.GetSetElements(set)
+		if err != nil {
+			return fmt.Errorf("failed to get ip%s elements from set: %w", c.version, err)
+		}
+
+		remaining := make(map[string]time.Duration, len(current))
+		for i := range current {
+			remaining[string(current[i].Key)] = current[i].Expires
+		}
+
+		// A shorter overlapping addition must not reduce a live timeout.
+		// Explicit removals are handled before additions by Commit.
+		refresh := make([]nftables.SetElement, 0, len(pending))
+		for i := range pending {
+			if pending[i].Timeout > remaining[string(pending[i].Key)] {
+				refresh = append(refresh, pending[i])
+			}
+		}
+
 		if c.setOnly {
 			setName = c.blacklists
 		} else {
 			setName = fmt.Sprintf("%s-%s", c.blacklists, origin)
 		}
 
-		log.Debugf("Using %s as origin | len of IPs: %d | set name is %s", origin, len(els[origin]), setName)
+		log.Debugf("Using %s as origin | len of IPs: %d | set name is %s", origin, len(refresh), setName)
 
-		for _, chunk := range slicetools.Chunks(els[origin], chunkSize) {
+		for _, chunk := range slicetools.Chunks(refresh, chunkSize) {
 			log.Debugf("adding %d ip%s elements to set %s", len(chunk), c.version, setName)
+
+			if err := c.conn.SetAddElements(set, chunk); err != nil {
+				return fmt.Errorf("failed to add ip%s elements to set: %w", c.version, err)
+			}
+
+			// An add alone does not refresh an existing element's timeout.
+			// Ensure every key exists, then replace the chunk in one atomic
+			// transaction so neither absent keys nor expiry races break deletion,
+			// and packets never observe the intermediate removal.
+			if err := c.conn.SetDeleteElements(set, chunk); err != nil {
+				return fmt.Errorf("failed to replace ip%s elements in set: %w", c.version, err)
+			}
 
 			if err := c.conn.SetAddElements(set, chunk); err != nil {
 				return fmt.Errorf("failed to add ip%s elements to set: %w", c.version, err)
